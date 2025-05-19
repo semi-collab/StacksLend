@@ -138,3 +138,81 @@
     )
   )
 )
+
+;; Repay an active loan (partial or full payment)
+(define-public (repay-loan
+    (loan-id uint)
+    (amount uint)
+  )
+  (let (
+      (sender tx-sender)
+      (loan (unwrap! (map-get? Loans { loan-id: loan-id }) ERR-LOAN-NOT-FOUND))
+    )
+    (asserts! (is-eq sender (get borrower loan)) ERR-UNAUTHORIZED)
+    (asserts! (get is-active loan) ERR-LOAN-NOT-FOUND)
+    (asserts! (not (get is-defaulted loan)) ERR-LOAN-DEFAULTED)
+    (asserts! (<= loan-id (var-get next-loan-id)) ERR-INVALID-LOAN-ID)
+    ;; Calculate total amount due
+    (let ((total-due (calculate-total-due loan)))
+      (asserts! (>= amount u0) ERR-INVALID-AMOUNT)
+      ;; Transfer repayment
+      (try! (stx-transfer? amount sender (as-contract tx-sender)))
+      ;; Update loan
+      (let ((new-repaid-amount (+ (get repaid-amount loan) amount)))
+        (map-set Loans { loan-id: loan-id }
+          (merge loan {
+            repaid-amount: new-repaid-amount,
+            is-active: (< new-repaid-amount total-due),
+          })
+        )
+        ;; If loan fully repaid, update score and return collateral
+        (if (>= new-repaid-amount total-due)
+          (begin
+            (try! (update-credit-score sender true loan))
+            (as-contract (try! (stx-transfer? (get collateral loan) tx-sender sender)))
+            (var-set total-stx-locked
+              (- (var-get total-stx-locked) (get collateral loan))
+            )
+          )
+          true
+        )
+        (ok true)
+      )
+    )
+  )
+)
+
+;; Admin Functions
+
+;; Mark a loan as defaulted when past due date
+(define-public (mark-loan-defaulted (loan-id uint))
+  (let ((loan (unwrap! (map-get? Loans { loan-id: loan-id }) ERR-LOAN-NOT-FOUND)))
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+    (asserts! (>= stacks-block-height (get due-height loan)) ERR-NOT-DUE)
+    (asserts! (get is-active loan) ERR-LOAN-NOT-FOUND)
+    (asserts! (<= loan-id (var-get next-loan-id)) ERR-INVALID-LOAN-ID)
+    ;; Update loan status
+    (map-set Loans { loan-id: loan-id }
+      (merge loan {
+        is-defaulted: true,
+        is-active: false,
+      })
+    )
+    ;; Update credit score
+    (try! (update-credit-score (get borrower loan) false loan))
+    (ok true)
+  )
+)
+
+;; Private Helper Functions
+
+;; Calculate collateral requirements based on credit score
+;; Higher scores require less collateral as percentage of loan amount
+(define-private (calculate-required-collateral
+    (amount uint)
+    (score uint)
+  )
+  (let ((collateral-ratio (- u100 (/ (* score u50) u100))))
+    (/ (* amount collateral-ratio) u100)
+  )
+)
